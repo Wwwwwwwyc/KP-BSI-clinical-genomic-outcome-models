@@ -1,0 +1,70 @@
+# Python cache and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+
+# R and editor artifacts
+.Rhistory
+.RData
+Rplots.pdf
+.DS_Store
+Thumbs.db
+Desktop.ini
+~$*
+*.tmp
+*.temp
+
+# Local project data, model outputs, and submission files
+01_data/
+02_features/
+submit/
+reference/
+docs/
+_archive/
+progress_reports/
+**/outputs/
+**/model_outputs/
+**/compact_model/
+**/gwas_inputs/
+
+# Data and manuscript-derived artifacts should not be committed here
+*.csv
+*.tsv
+*.xlsx
+*.xls
+*.parquet
+*.rds
+*.pkl
+*.pickle
+*.joblib
+*.jsonl
+*.png
+*.jpg
+*.jpeg
+*.tif
+*.tiff
+*.pdf
+*.doc
+*.docx
+*.ppt
+*.pptx
+
+# Private genomic inputs and derived phylogenies
+*.Rtab
+*.fa
+*.fasta
+*.fna
+*.fq
+*.fastq
+*.vcf
+*.nwk
+*.newick
+*.tree
+*.gz
+
+# Sequence reference files and local evaluation inputs
+*.faa
+*.json
+!parameters/compact_model.json
