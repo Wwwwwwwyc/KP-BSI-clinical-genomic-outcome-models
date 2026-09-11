@@ -68,3 +68,7 @@ progress_reports/
 *.faa
 *.json
 !parameters/compact_model.json
+
+# Bundled locked reference sequences required to reproduce the external validation
+!04_analysis/external_validation/references/*.faa
+!04_analysis/external_validation/references/*.fna
