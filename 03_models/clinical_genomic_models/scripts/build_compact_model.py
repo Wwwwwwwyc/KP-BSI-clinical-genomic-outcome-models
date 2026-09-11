@@ -40,7 +40,7 @@ from sklearn.metrics import confusion_matrix
 warnings.filterwarnings("ignore", category=FutureWarning)
 
 HELP = """Function
-  Build a compact clinical-genomic model for liver abscess or metastatic infection. Candidate predictors include clinical variables, antimicrobial susceptibility, hypervirulence-associated markers, and validation-selected GWAS features. The script applies training-only elastic-net stability selection, chooses the compact logistic model on 2022-2023 validation data, calibrates probabilities on that validation set, and evaluates the locked 2013-2021 training model on the combined 2024-2025 temporal test set.
+  Build a compact clinical-genomic model for liver abscess or metastatic infection. Candidate predictors include clinical variables, antimicrobial susceptibility, hypervirulence-associated markers, and validation-selected GWAS features. The script applies training-only elastic-net stability selection, chooses the compact logistic model on 2022-2023 validation data, calibrates probabilities on that validation set, refits the final compact model on the pooled discovery and validation development cohort, and evaluates it on the combined 2024-2025 temporal test set.
 
 Required Arguments
   --run
@@ -359,12 +359,33 @@ def candidate_feature_sets(
     return list(candidates.values())
 
 
-def fit_predict(train_df: pd.DataFrame, eval_df: pd.DataFrame, features: list[str], c_value: float) -> np.ndarray:
+def fit_model(train_df: pd.DataFrame, features: list[str], c_value: float) -> tuple[object, LogisticRegression]:
     x_train, preprocessor = prepare_features(train_df, features, fit=True)
-    x_eval, _ = prepare_features(eval_df, features, preprocessor=preprocessor)
     model = LogisticRegression(C=c_value, solver="lbfgs", max_iter=10000)
     model.fit(x_train, train_df[OUTCOME].to_numpy())
+    if preprocessor.transformed_to_feature is None:
+        raise ValueError("Fitted preprocessor did not expose transformed feature ownership")
+    return preprocessor, model
+
+
+def predict_with(preprocessor: object, model: LogisticRegression, eval_df: pd.DataFrame, features: list[str]) -> np.ndarray:
+    x_eval, _ = prepare_features(eval_df, features, preprocessor=preprocessor)
     return np.asarray(model.predict_proba(x_eval)[:, 1], dtype=float)
+
+
+def model_coefficients(preprocessor: object, model: LogisticRegression, features: list[str]) -> dict[str, float]:
+    coefficients: dict[str, list[float]] = {feature: [] for feature in features}
+    for owner, coef in zip(preprocessor.transformed_to_feature, model.coef_[0]):
+        coefficients[owner].append(float(coef))
+    return {
+        feature: float(np.asarray(values)[np.argmax(np.abs(values))]) if values else 0.0
+        for feature, values in coefficients.items()
+    }
+
+
+def fit_predict(train_df: pd.DataFrame, eval_df: pd.DataFrame, features: list[str], c_value: float) -> np.ndarray:
+    preprocessor, model = fit_model(train_df, features, c_value)
+    return predict_with(preprocessor, model, eval_df, features)
 
 
 def logit_prob(prob: np.ndarray) -> np.ndarray:
@@ -519,24 +540,8 @@ def candidate_table(choices: list[PanelChoice], chosen: PanelChoice) -> pd.DataF
     return pd.DataFrame(rows).sort_values(["selected", "n_features", "Brier", "AUROC"], ascending=[False, True, True, False])
 
 
-def fit_coefficients(train_df: pd.DataFrame, features: list[str], c_value: float) -> dict[str, float]:
-    x_train, preprocessor = prepare_features(train_df, features, fit=True)
-    model = LogisticRegression(C=c_value, solver="lbfgs", max_iter=10000)
-    model.fit(x_train, train_df[OUTCOME].to_numpy())
-    if preprocessor.transformed_to_feature is None:
-        raise ValueError("Fitted preprocessor did not expose transformed feature ownership")
-    coefficients: dict[str, list[float]] = {feature: [] for feature in features}
-    for owner, coef in zip(preprocessor.transformed_to_feature, model.coef_[0]):
-        coefficients[owner].append(float(coef))
-    return {
-        feature: float(np.asarray(values)[np.argmax(np.abs(values))]) if values else 0.0
-        for feature, values in coefficients.items()
-    }
-
-
-def selected_feature_table(features: list[str], ranked: pd.DataFrame, train_df: pd.DataFrame, c_value: float, gwas_features: list[str]) -> pd.DataFrame:
+def selected_feature_table(features: list[str], ranked: pd.DataFrame, coef_lookup: dict[str, float], gwas_features: list[str]) -> pd.DataFrame:
     rank_lookup = ranked.set_index("feature")
-    coef_lookup = fit_coefficients(train_df, features, c_value)
     rows = []
     for order, feature in enumerate(features, start=1):
         rows.append(
@@ -557,7 +562,7 @@ def prediction_tables(
     splits: dict[str, pd.DataFrame],
     config: SplitConfig,
     full_features: list[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     discovery = splits[config.discovery_label]
     validation = splits[config.validation_label]
     test = splits[config.test_label]
@@ -570,7 +575,9 @@ def prediction_tables(
     validation_prob = apply_platt_recalibration(validation_prob_raw, compact_calibrator)
     validation_threshold = youden_threshold(y_validation, validation_prob)
     final_development = pd.concat([discovery, validation], ignore_index=True)
-    test_prob_raw = fit_predict(final_development, test, selected_features, chosen.model_c)
+    final_preprocessor, final_model = fit_model(final_development, selected_features, chosen.model_c)
+    test_prob_raw = predict_with(final_preprocessor, final_model, test, selected_features)
+    final_coefficients = model_coefficients(final_preprocessor, final_model, selected_features)
     test_prob = apply_platt_recalibration(test_prob_raw, compact_calibrator)
 
     full_validation_prob_raw = fit_predict(discovery, validation, full_features, 0.01)
@@ -614,7 +621,7 @@ def prediction_tables(
     predictions[f"{MODEL_ID}_prob"] = test_prob
     predictions[f"{REFERENCE_ID}_raw_prob"] = full_prob_raw
     predictions[f"{REFERENCE_ID}_prob"] = full_prob
-    return pd.DataFrame(compressed_rows), pd.DataFrame(reference_rows), predictions
+    return pd.DataFrame(compressed_rows), pd.DataFrame(reference_rows), predictions, final_coefficients
 
 
 def source_data_tables(predictions: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
@@ -660,9 +667,12 @@ def feature_contract_audit(all_features: list[str], selected_features: list[str]
     )
 
 
-def write_readme(output_dir: Path, compressed: pd.DataFrame, reference: pd.DataFrame, selected: list[str]) -> None:
+def write_readme(output_dir: Path, compressed: pd.DataFrame, reference: pd.DataFrame, selected: list[str], config: SplitConfig) -> None:
     test_row = compressed[compressed["split"].str.startswith("test_")].iloc[0]
     reference_row = reference.iloc[0]
+    discovery_span = f"{min(config.discovery_years)}-{max(config.discovery_years)}"
+    validation_span = f"{min(config.validation_years)}-{max(config.validation_years)}"
+    test_span = f"{min(config.test_years)}-{max(config.test_years)}"
     text = f"""# Compact Metastatic-Infection Model
 
 This directory contains the compact model selected from the full clinical-genomic predictor set.
@@ -678,7 +688,7 @@ This directory contains the compact model selected from the full clinical-genomi
 | Compact model | {int(test_row['n_features'])} | {float(test_row['AUROC']):.3f} | {float(test_row['AUPRC']):.3f} | {float(test_row['Brier']):.3f} | {float(test_row['locked_sensitivity']):.3f} | {float(test_row['locked_specificity']):.3f} | {float(test_row['locked_PPV']):.3f} | {float(test_row['locked_NPV']):.3f} |
 | Full model | {int(reference_row['n_features'])} | {float(reference_row['AUROC']):.3f} | {float(reference_row['AUPRC']):.3f} | {float(reference_row['Brier']):.3f} | {float(reference_row['locked_sensitivity']):.3f} | {float(reference_row['locked_specificity']):.3f} | {float(reference_row['locked_PPV']):.3f} | {float(reference_row['locked_NPV']):.3f} |
 
-Predicted probabilities are generated by the 2013-2021 training model. They are recalibrated by a Platt intercept and slope fitted on the 2022-2023 validation split and applied unchanged to the combined 2024-2025 test split. Threshold-dependent metrics use thresholds selected on the recalibrated validation predictions and applied unchanged to the test split.
+Predicted probabilities are generated by the final model refitted on the pooled {discovery_span} development cohort. They are recalibrated by a Platt intercept and slope fitted on the {validation_span} validation predictions of the {discovery_span} selection model and applied unchanged to the combined {test_span} test split. Threshold-dependent metrics use thresholds selected on the recalibrated validation predictions and applied unchanged to the test split.
 """
     (output_dir / "README.md").write_text(text, encoding="utf-8")
 
@@ -709,7 +719,7 @@ def run(paths: Paths, args: argparse.Namespace) -> None:
     chosen, selection_audit = choose_panel(choices, args.auc_tolerance, args.brier_tolerance)
     selected_features = list(chosen.features)
 
-    compressed, reference, predictions = prediction_tables(chosen, splits, config, features)
+    compressed, reference, predictions, final_coefficients = prediction_tables(chosen, splits, config, features)
     roc, pr, cal, dca, threshold = source_data_tables(predictions)
     paired = paired_bootstrap_metric_delta(
         predictions,
@@ -721,7 +731,7 @@ def run(paths: Paths, args: argparse.Namespace) -> None:
         n_bootstrap=args.bootstrap,
         seed=args.seed,
     )
-    selected_features_df = selected_feature_table(selected_features, ranked, discovery, chosen.model_c, gwas_features)
+    selected_features_df = selected_feature_table(selected_features, ranked, final_coefficients, gwas_features)
 
     selected_features_df.to_csv(paths.output_dir / "selected_features.csv", index=False)
     frequencies.to_csv(paths.output_dir / "selection_frequency.csv", index=False)
@@ -755,16 +765,16 @@ def run(paths: Paths, args: argparse.Namespace) -> None:
             "validation_years": config.validation_years,
             "test_years": config.test_years,
         },
-        "test_model_training_split": config.discovery_label,
-        "test_model_training_years": config.discovery_years,
-        "probability_calibration": "fit Platt intercept and slope on validation predictions from the 2013-2021 training model; apply unchanged to temporal-test probabilities from that same model",
+        "final_model_training_split": f"development_pooled_{config.discovery_label}_{config.validation_label}",
+        "final_model_training_years": sorted(set(config.discovery_years) | set(config.validation_years)),
+        "probability_calibration": f"fit Platt intercept and slope on {config.validation_label} predictions generated by the {config.discovery_label} selection model; apply unchanged to temporal-test probabilities from the pooled development final model",
         "threshold_policy": "select Youden threshold on validation-recalibrated predictions; apply unchanged to the test set",
         "bootstrap_resamples": args.bootstrap,
         "generated_files": sorted({path.name for path in paths.output_dir.iterdir() if path.is_file()} | {"run_manifest.json", "README.md"}),
     }
     with (paths.output_dir / "run_manifest.json").open("w", encoding="utf-8") as handle:
         json.dump(manifest, handle, ensure_ascii=False, indent=2)
-    write_readme(paths.output_dir, compressed, reference, selected_features)
+    write_readme(paths.output_dir, compressed, reference, selected_features, config)
 
 
 def main(argv: list[str]) -> int:
